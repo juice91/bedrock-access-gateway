@@ -210,7 +210,6 @@ class BedrockModel(BaseChatModel):
         """Default implementation for Chat Stream API"""
         response = self._invoke_bedrock(chat_request, stream=True)
         message_id = self.generate_message_id()
-
         stream = response.get("stream")
         for chunk in stream:
             stream_response = self._create_response_stream(
@@ -291,23 +290,24 @@ class BedrockModel(BaseChatModel):
                             ),
                         }
                     )
-                else:
+                if message.tool_calls:
                     # Tool use message
-                    tool_input = json.loads(message.tool_calls[0].function.arguments)
-                    messages.append(
-                        {
-                            "role": message.role,
-                            "content": [
-                                {
-                                    "toolUse": {
-                                        "toolUseId": message.tool_calls[0].id,
-                                        "name": message.tool_calls[0].function.name,
-                                        "input": tool_input
+                    for tool_call in message.tool_calls:
+                        tool_input = json.loads(tool_call.function.arguments)
+                        messages.append(
+                            {
+                                "role": message.role,
+                                "content": [
+                                    {
+                                        "toolUse": {
+                                            "toolUseId": tool_call.id,
+                                            "name": tool_call.function.name,
+                                            "input": tool_input
+                                        }
                                     }
-                                }
-                            ],
-                        }
-                    )
+                                ],
+                            }
+                        )
             elif isinstance(message, ToolMessage):
                 # Bedrock does not support tool role,
                 # Add toolResult to content
@@ -397,7 +397,6 @@ class BedrockModel(BaseChatModel):
 
         Ref: https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html
         """
-
         messages = self._parse_messages(chat_request)
         system_prompts = self._parse_system_prompts(chat_request)
 
@@ -420,6 +419,22 @@ class BedrockModel(BaseChatModel):
             "system": system_prompts,
             "inferenceConfig": inference_config,
         }
+        if chat_request.reasoning_effort:
+            # From OpenAI api, the max_token is not supported in reasoning mode
+            # Use max_completion_tokens if provided.
+
+            max_tokens = chat_request.max_completion_tokens if chat_request.max_completion_tokens else chat_request.max_tokens
+            budget_tokens = self._calc_budget_tokens(max_tokens, chat_request.reasoning_effort)
+            inference_config["maxTokens"] = max_tokens
+            # unset topP - Not supported
+            inference_config.pop("topP")
+
+            args["additionalModelRequestFields"] = {
+                "reasoning_config": {
+                    "type": "enabled",
+                    "budget_tokens": budget_tokens
+                }
+            }
         # add tool config
         if chat_request.tools:
             args["toolConfig"] = {
@@ -476,8 +491,13 @@ class BedrockModel(BaseChatModel):
             message.content = None
         else:
             message.content = ""
-            if content:
-                message.content = content[0]["text"]
+            for c in content:
+                if "reasoningContent" in c:
+                    message.reasoning_content = c["reasoningContent"]["reasoningText"].get("text", "")
+                elif "text" in c:
+                    message.content = c["text"]
+                else:
+                    logger.warning("Unknown tag in message content " + ",".join(c.keys()))
 
         response = ChatResponse(
             id=message_id,
@@ -545,6 +565,12 @@ class BedrockModel(BaseChatModel):
                 message = ChatResponseMessage(
                     content=delta["text"],
                 )
+            elif "reasoningContent" in delta:
+                # ignore "signature" in the delta.
+                if "text" in delta["reasoningContent"]:
+                    message = ChatResponseMessage(
+                        reasoning_content=delta["reasoningContent"]["text"],
+                    )
             else:
                 # tool use
                 index = chunk["contentBlockDelta"]["contentBlockIndex"] - 1
@@ -681,6 +707,18 @@ class BedrockModel(BaseChatModel):
                 },
             }
         }
+
+    def _calc_budget_tokens(self, max_tokens: int, reasoning_effort: Literal["low", "medium", "high"]) -> int:
+        # Helper function to calculate budget_tokens based on the max_tokens.
+        # Ratio for efforts:  Low - 30%, medium - 60%, High: Max token - 1
+        # Note that The minimum budget_tokens is 1,024 tokens so far.
+        # But it may be changed for different models in the future.
+        if reasoning_effort == "low":
+            return int(max_tokens * 0.3)
+        elif reasoning_effort == "medium":
+            return int(max_tokens * 0.6)
+        else:
+            return max_tokens - 1
 
     def _convert_finish_reason(self, finish_reason: str | None) -> str | None:
         """
